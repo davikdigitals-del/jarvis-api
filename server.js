@@ -10,14 +10,17 @@ app.use(express.json({ limit: "1mb" }));
 app.use(cors({ origin: true }));
 
 // ================== IN-MEMORY STORE (Phase 1) ==================
-// siteStore key = siteKey (domain or siteId fallback)
-const siteStore = new Map(); // { pages: [{id,title,url,text}], updatedAt: number }
+const siteStore = new Map(); // siteKey -> { pages: [...], updatedAt, siteUrl }
 const chatLogs = []; // last N chats
 
 // Simple rate limiter: per IP
 const RATE_WINDOW_MS = 60_000; // 1 min
 const RATE_MAX = 60; // 60 req/min/IP
 const rateMap = new Map(); // ip -> { count, resetAt }
+
+// Sync throttle per site (avoid spamming)
+const SYNC_COOLDOWN_MS = 5 * 60_000; // 5 minutes
+const syncState = new Map(); // siteKey -> { lastSyncAt }
 
 // ================== HELPERS ==================
 function getIP(req) {
@@ -74,17 +77,23 @@ function isBookingIntent(text = "") {
     t.includes("schedule") ||
     t.includes("reserve") ||
     t.includes("consultation") ||
-    t.includes("call") && t.includes("book")
+    (t.includes("call") && t.includes("book"))
   );
 }
 
+// ✅ Normalize domains so www. and non-www match
+function normDomain(d = "") {
+  return String(d).toLowerCase().replace(/^www\./, "").trim();
+}
+
+// ✅ Strong siteKey: normalized domain first, fallback to siteId
 function getSiteKey({ siteId = "", domain = "" }) {
-  // Prefer domain. Fallback to siteId.
-  return (domain || siteId || "default").toLowerCase();
+  const d = normDomain(domain);
+  const s = String(siteId || "").toLowerCase().trim();
+  return (d || s || "default");
 }
 
 function scoreDoc(query, docText) {
-  // Phase 1: lightweight keyword scoring
   const q = String(query).toLowerCase().split(/\s+/).filter(Boolean);
   const d = String(docText).toLowerCase();
   let score = 0;
@@ -108,8 +117,56 @@ function pickTopDocs(siteKey, query, topK = 3) {
   return scored;
 }
 
-// ================== ROUTES ==================
+function shouldSync(siteKey) {
+  const now = Date.now();
+  const st = syncState.get(siteKey);
+  if (!st) return true;
+  return (now - st.lastSyncAt) > SYNC_COOLDOWN_MS;
+}
 
+function markSynced(siteKey) {
+  syncState.set(siteKey, { lastSyncAt: Date.now() });
+}
+
+// ✅ Shared sync logic used by both /v1/site/sync and auto-sync in chat
+async function syncSiteContent({ base, siteKey }) {
+  const pagesUrl = `${base}/wp-json/wp/v2/pages?per_page=100&_fields=id,link,title,content`;
+  const postsUrl = `${base}/wp-json/wp/v2/posts?per_page=100&_fields=id,link,title,content`;
+
+  const [pagesRes, postsRes] = await Promise.all([
+    fetch(pagesUrl),
+    fetch(postsUrl),
+  ]);
+
+  if (!pagesRes.ok || !postsRes.ok) {
+    const t1 = await pagesRes.text().catch(() => "");
+    const t2 = await postsRes.text().catch(() => "");
+    throw new Error(
+      `Failed WP REST fetch. pages(${pagesRes.status}) posts(${postsRes.status}) :: ${t1.slice(0,120)} ${t2.slice(0,120)}`
+    );
+  }
+
+  const pagesJson = await pagesRes.json();
+  const postsJson = await postsRes.json();
+
+  const docs = [];
+  for (const p of [...pagesJson, ...postsJson]) {
+    const title = p?.title?.rendered || "Untitled";
+    const url = p?.link || "";
+    const html = p?.content?.rendered || "";
+    const text = cleanHtmlToText(html);
+    if (text.length < 40) continue;
+
+    docs.push({ id: p.id, title, url, text });
+  }
+
+  siteStore.set(siteKey, { pages: docs, updatedAt: Date.now(), siteUrl: base });
+  markSynced(siteKey);
+
+  return { count: docs.length };
+}
+
+// ================== ROUTES ==================
 app.get("/", (req, res) => {
   res.send("Jarvis API is running ✅");
 });
@@ -121,7 +178,6 @@ app.get("/health", (req, res) => {
 /**
  * Phase 1 site sync
  * Input: { siteUrl, siteId, domain }
- * Action: fetch WP pages/posts via REST and store cleaned text
  */
 app.post("/v1/site/sync", rateLimit, async (req, res) => {
   const { siteUrl = "", siteId = "", domain = "" } = req.body || {};
@@ -131,65 +187,35 @@ app.post("/v1/site/sync", rateLimit, async (req, res) => {
     return res.status(400).json({ ok: false, error: "siteUrl is required" });
   }
 
-  const siteKey = getSiteKey({ siteId, domain: domain || new URL(base).host });
+  const derivedDomain = (() => {
+    try { return normDomain(domain || new URL(base).host); } catch { return normDomain(domain); }
+  })();
+
+  const siteKey = getSiteKey({ siteId, domain: derivedDomain });
 
   try {
-    // Pull pages + posts
-    const pagesUrl = `${base}/wp-json/wp/v2/pages?per_page=100&_fields=id,link,title,content`;
-    const postsUrl = `${base}/wp-json/wp/v2/posts?per_page=100&_fields=id,link,title,content`;
-
-    const [pagesRes, postsRes] = await Promise.all([
-      fetch(pagesUrl),
-      fetch(postsUrl),
-    ]);
-
-    if (!pagesRes.ok || !postsRes.ok) {
-      const t1 = await pagesRes.text().catch(() => "");
-      const t2 = await postsRes.text().catch(() => "");
-      return res.status(400).json({
-        ok: false,
-        error: "Failed to fetch WP REST content. Ensure site is public and REST API is accessible.",
-        details: { pages: t1.slice(0, 200), posts: t2.slice(0, 200) },
-      });
-    }
-
-    const pagesJson = await pagesRes.json();
-    const postsJson = await postsRes.json();
-
-    const docs = [];
-
-    for (const p of [...pagesJson, ...postsJson]) {
-      const title = p?.title?.rendered || "Untitled";
-      const url = p?.link || "";
-      const html = p?.content?.rendered || "";
-      const text = cleanHtmlToText(html);
-
-      if (text.length < 40) continue;
-
-      docs.push({
-        id: p.id,
-        title,
-        url,
-        text,
-      });
-    }
-
-    siteStore.set(siteKey, { pages: docs, updatedAt: Date.now(), siteUrl: base });
+    const result = await syncSiteContent({ base, siteKey });
 
     return res.json({
       ok: true,
       siteKey,
-      count: docs.length,
+      count: result.count,
       updatedAt: new Date().toISOString(),
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: "Sync failed", details: String(e) });
+    return res.status(500).json({
+      ok: false,
+      error: "Sync failed",
+      details: String(e),
+      siteKey,
+      base,
+    });
   }
 });
 
 /**
  * Chat endpoint
- * Input: { siteId, domain, sessionId, text, bookingUrl, pageUrl }
+ * Input: { siteId, domain, sessionId, text, bookingUrl, pageUrl, siteUrl }
  * Output: { replyText, actions?, sources? }
  */
 app.post("/v1/chat", rateLimit, async (req, res) => {
@@ -200,10 +226,12 @@ app.post("/v1/chat", rateLimit, async (req, res) => {
     domain = "",
     sessionId = "",
     pageUrl = "",
+    siteUrl = "", // ✅ allow plugin/widget to send siteUrl
   } = req.body || {};
 
   const userText = String(text || "").trim();
-  const siteKey = getSiteKey({ siteId, domain });
+  const d = normDomain(domain);
+  const siteKey = getSiteKey({ siteId, domain: d });
 
   // Basic log (last 200)
   chatLogs.push({
@@ -217,9 +245,7 @@ app.post("/v1/chat", rateLimit, async (req, res) => {
 
   // Wake phrase
   if (isWakePhrase(userText)) {
-    return res.json({
-      replyText: "How can I help you?",
-    });
+    return res.json({ replyText: "How can I help you?" });
   }
 
   // Booking intent
@@ -237,16 +263,35 @@ app.post("/v1/chat", rateLimit, async (req, res) => {
     });
   }
 
+  // ✅ AUTO-SYNC if not trained (NO manual sync required)
+  const existing = siteStore.get(siteKey);
+  const hasSynced = !!(existing && Array.isArray(existing.pages) && existing.pages.length);
+
+  if (!hasSynced && shouldSync(siteKey)) {
+    // Determine base site URL from request
+    let base = String(siteUrl || "").trim().replace(/\/$/, "");
+    if (!base) {
+      try {
+        if (pageUrl) base = new URL(pageUrl).origin;
+      } catch {}
+    }
+    if (!base && d) base = `https://${d}`;
+
+    // Try auto sync silently
+    if (base) {
+      try {
+        await syncSiteContent({ base, siteKey });
+      } catch (e) {
+        // If auto sync fails, continue without crashing
+        // (we just answer with a helpful fallback)
+      }
+    }
+  }
+
   // Site Q&A (Phase 1 retrieval)
   const topDocs = pickTopDocs(siteKey, userText, 3);
 
-  // If we have site content, give a grounded answer summary
   if (topDocs.length > 0) {
-    const bullets = topDocs
-      .map((d) => `• ${d.title}${d.url ? ` — ${d.url}` : ""}`)
-      .join("\n");
-
-    // Phase 1: simple answer by quoting relevant snippet (short)
     const best = topDocs[0];
     const snippet = best.text.slice(0, 320);
 
@@ -263,26 +308,15 @@ app.post("/v1/chat", rateLimit, async (req, res) => {
     });
   }
 
-  // If no content synced yet, guide the admin to sync
-  const site = siteStore.get(siteKey);
-  const hasSynced = !!(site && Array.isArray(site.pages) && site.pages.length);
-
-  if (!hasSynced) {
-    return res.json({
-      replyText:
-        "I’m not trained on this website yet. Ask the admin to run a Site Sync so I can learn the site pages and answer accurately.",
-      meta: { learned: false, siteKey },
-    });
-  }
-
-  // Fallback
+  // If still no content, do NOT tell user to run sync (since we want no manual)
   return res.json({
     replyText:
-      "I can help answer questions about this website or help you book a service. What would you like to do?",
+      "I’m still learning this website. Try asking about services, pricing, contact, or booking — and I’ll guide you.",
+    meta: { learned: false, siteKey },
   });
 });
 
-// Optional: admin/debug endpoint (remove later)
+// Debug endpoints
 app.get("/v1/debug/sites", (req, res) => {
   const out = [];
   for (const [k, v] of siteStore.entries()) {
@@ -296,7 +330,6 @@ app.get("/v1/debug/sites", (req, res) => {
   res.json({ sites: out });
 });
 
-// Optional: view recent logs
 app.get("/v1/debug/logs", (req, res) => {
   res.json({ logs: chatLogs.slice(-50) });
 });
